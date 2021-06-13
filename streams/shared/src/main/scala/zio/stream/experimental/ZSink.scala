@@ -3,6 +3,7 @@ package zio.stream.experimental
 import zio._
 
 import java.util.concurrent.atomic.AtomicReference
+import scala.collection.mutable
 
 class ZSink[-R, -InErr, -In, +OutErr, +L, +Z](val channel: ZChannel[R, InErr, Chunk[In], Any, OutErr, Chunk[L], Z])
     extends AnyVal { self =>
@@ -954,6 +955,66 @@ object ZSink {
     new ZSink(ZChannel.managed(resource)(fn(_).channel))
 
   val never: ZSink[Any, Any, Any, Nothing, Nothing, Nothing] = new ZSink(ZChannel.fromEffect(ZIO.never))
+
+  /**
+   * A sink that splits elements on a delimeter and transforms them into
+   * desired output
+   */
+  def splitOnChunk[A](delimiter: Chunk[A]): ZSink[Any, Nothing, A, Nothing, A, Chunk[A]] = {
+    def channel(buffer: Chunk[A], splitIndex: Int): ZChannel[Any, Any, Chunk[A], Any, Nothing, Chunk[A], Chunk[A]] =
+      ZChannel.readWith(
+        (inputChunk: Chunk[A]) => {
+          var out: mutable.ArrayBuffer[Chunk[A]] = null
+          var chunkIndex                         = 0
+          var newBuffer                          = buffer
+          var newSplitIndex                      = splitIndex
+
+          while (chunkIndex < inputChunk.length) {
+            val in    = newBuffer :+ inputChunk(chunkIndex)
+            var index = newBuffer.length
+            var start = 0
+            newBuffer = Chunk.empty
+            while (index < in.length) {
+              while (newSplitIndex < delimiter.length && index < in.length && in(index) == delimiter(newSplitIndex)) {
+                newSplitIndex += 1
+                index += 1
+              }
+              if (newSplitIndex == delimiter.length || in.isEmpty) {
+                if (out eq null) out = mutable.ArrayBuffer[Chunk[A]]()
+                val slice = in.slice(start, index - delimiter.length)
+                out += slice
+                newSplitIndex = 0
+                start = index
+              }
+              if (index < in.length) {
+                newSplitIndex = 0
+                while (index < in.length && in(index) != delimiter(0)) index += 1
+              }
+            }
+
+            if (start < in.length) {
+              newBuffer = in.drop(start)
+            }
+
+            chunkIndex += 1
+          }
+
+          val chunk = if (out eq null) Chunk.empty else Chunk.fromArray(out.toArray)
+
+          println(s"Given $inputChunk produces $chunk and calls channel($newBuffer, $newSplitIndex)")
+
+          ZChannel.writeChunk(chunk) *> channel(newBuffer, newSplitIndex)
+        },
+        (_: Any) => ZChannel.end(buffer),
+        (_: Any) => {
+          if (buffer.nonEmpty) println(s"Terminating with $buffer and $splitIndex")
+
+          ZChannel.end(buffer)
+        }
+      )
+
+    new ZSink(channel(Chunk.empty, 0))
+  }
 
   /**
    * A sink that immediately ends with the specified value.
